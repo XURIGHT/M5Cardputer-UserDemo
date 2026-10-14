@@ -44,7 +44,7 @@ extern "C" void app_main(void)
     // GetMooncake().installApp(std::make_unique<AppDummy>());
 
     // Main loop
-    audio::set_keyboard_sfx_enable(true);
+    audio::set_keyboard_sfx_enable(false);
     while (1) {
         GetHAL().feedTheDog();
         GetHAL().update();
