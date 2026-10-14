@@ -1,0 +1,35 @@
+name: Build Cardputer ADV Silent Firmware
+
+on:
+  push:
+    branches: [CardputerADV]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout Cardputer ADV source
+        uses: actions/checkout@v4
+      - name: Build with ESP-IDF 5.4.2
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v5.4.2
+          target: esp32s3
+          path: '.'
+          command: 'python3 fetch_repos.py && idf.py build'
+      - name: Upload firmware and flash instructions
+        uses: actions/upload-artifact@v4
+        with:
+          name: Cardputer-ADV-silent-firmware
+          if-no-files-found: error
+          path: |
+            build/*.bin
+            build/bootloader/bootloader.bin
+            build/partition_table/partition-table.bin
+            build/flash_args
+            build/flasher_args.json
