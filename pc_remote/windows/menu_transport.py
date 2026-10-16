@@ -7,7 +7,7 @@ KIND_MENU = 2
 
 def menu_payloads(entries=None):
     entries = load_catalog() if entries is None else entries
-    pages = catalog_pages(entries)
+    pages = catalog_pages(entries, max_bytes=900)
     total = len(pages)
     return [json.dumps({"type": "MENU_RESPONSE", "page": i,
                         "pages": total, "menu": page},
