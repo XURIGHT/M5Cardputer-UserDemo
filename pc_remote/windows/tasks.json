@@ -1,18 +1,15 @@
 {
+  "protocol_version": 2,
   "tasks": {
     "open_notepad": {
-      "argv": [
-        "notepad.exe"
-      ]
+      "label": "Open Notepad",
+      "category": "Windows",
+      "argv": ["notepad.exe"]
     },
     "wsl_python_demo": {
-      "argv": [
-        "wsl.exe",
-        "--",
-        "python3",
-        "-c",
-        "print('PC Remote WSL Python ready')"
-      ]
+      "label": "WSL Python Demo",
+      "category": "WSL",
+      "argv": ["wsl.exe", "--", "python3", "-c", "print('PC Remote WSL Python ready')"]
     }
   }
 }
