@@ -4,6 +4,7 @@ on:
     branches: [feature/pc-remote-generic]
     paths:
       - 'pc_remote/windows/**'
+      - 'main/apps/app_pc_remote/**'
       - '.github/workflows/pc-remote-tests.yml'
   workflow_dispatch:
 permissions:
@@ -19,3 +20,4 @@ jobs:
       - name: Run protocol and catalog tests
         working-directory: pc_remote/windows
         run: python -m unittest discover -p 'test_*.py' -v
+

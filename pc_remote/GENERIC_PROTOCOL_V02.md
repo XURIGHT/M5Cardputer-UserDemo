@@ -43,3 +43,10 @@ BLE pairing alone is not an application authorization decision. Require an expli
 
 ## Non-goals for v0.2
 Firmware OTA over BLE, arbitrary remote terminal, unrestricted Codex shell access, desktop video streaming.
+
+
+## Implemented menu slice
+
+Windows proactively uploads kind-2 MENU_RESPONSE pages after subscribing to notifications. Frame payload size is min(120, negotiated ATT MTU - 11). JSON page size is bounded by both 1024 bytes and 16 fragments. Firmware queues completed messages and parses/draws them in the app loop, never in a BLE callback. Disconnect clears queued/incomplete menu data.
+
+This slice uses compact ASCII device notifications `RUN:<zero-based catalog index>:<sequence>` and host writes `ACK:<sequence>:OK` or `ACK:<sequence>:ERR`. The index refers to the exact catalog snapshot uploaded on that connection. The bridge resolves it to an allowlisted task ID; the device never supplies command arguments. Duplicate sequences return the cached response within one connection. Unacknowledged requests stay pending until ACK or disconnect; no automatic execution retry occurs. Generic framed task requests, pairing and job completion status remain future work. PING/PONG remains supported.

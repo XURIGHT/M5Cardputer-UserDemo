@@ -2,7 +2,7 @@ name: Build Cardputer ADV Firmware
 
 on:
   push:
-    branches: [CardputerADV, 'feature/pc-remote-ble']
+    branches: [CardputerADV, 'feature/pc-remote-ble', 'feature/pc-remote-generic']
   workflow_dispatch:
 
 permissions:
@@ -33,3 +33,4 @@ jobs:
             build/partition_table/partition-table.bin
             build/flash_args
             build/flasher_args.json
+

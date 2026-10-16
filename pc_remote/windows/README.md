@@ -1,40 +1,36 @@
-# PC Remote v0.1 — Windows host (first slice)
+# PC Remote dynamic menu
 
-This is a **Windows-side prototype**, not yet a Cardputer firmware app. No firmware was flashed or modified by this commit.
+Windows owns the task catalog. Cardputer receives it over BLE, displays three rows at a time, and sends the selected index when Enter is pressed. Up/Down select; G0 returns by rebooting, matching the existing BLE lifecycle.
 
-## Start (PowerShell on Windows)
+## Windows setup after flashing the new firmware
 
-Install Python 3.10+ if needed. From this directory:
+Download the complete `pc_remote/windows` directory from `feature/pc-remote-generic`; replacing only a test file is insufficient. Keep your own tasks.json if customized. Python 3.10+ is required.
+
+In PowerShell, in this directory:
 
 ```powershell
+python -m pip install bleak
 $env:PC_REMOTE_TOKEN = (python -c "import secrets; print(secrets.token_hex(24))")
-python server.py
+Start-Process python -ArgumentList 'server.py' -WorkingDirectory $PWD
+python ble_bridge.py
 ```
 
-By default the server binds to `127.0.0.1:8765` (local-only). In a second PowerShell:
+The child server inherits the token. Keep the bridge terminal open. Open PC Remote on Cardputer; the bridge reconnects automatically and prints `Menu sent: 2 tasks`. The device should display Open Notepad and WSL Python Demo. Use Up/Down (Fn arrow keys on the keyboard) and Enter. `Result: OK` means the Windows server started the process, not that a long-running task finished successfully.
 
-```powershell
-$headers = @{ 'X-PC-Remote-Token' = $env:PC_REMOTE_TOKEN }
-Invoke-RestMethod http://127.0.0.1:8765/status -Headers $headers
-Invoke-RestMethod http://127.0.0.1:8765/tasks -Headers $headers
-Invoke-RestMethod http://127.0.0.1:8765/run -Method Post -Headers $headers -ContentType 'application/json' -Body '{"task":"open_notepad"}'
+If an old server is already listening on port 8765, close that server's terminal before starting this one. The token must match the running server. On reconnection the bridge fetches its current catalog; restart server and reconnect bridge after editing tasks.json.
+
+Only IDs from the displayed server catalog are submitted to `/run`; arguments and commands remain owned by the server's allowlist. The prototype BLE service is not authenticated or bonded yet. Keep this as a local prototype; do not add sensitive tasks before implementing pairing.
+
+## Limits and diagnostics
+
+64 tasks, 16 pages, 95 UTF-8 bytes per label; an item must also fit the negotiated BLE page size. Oversized catalogs fail explicitly in the bridge rather than silently truncating. The existing screen font determines which Unicode glyphs render. Default English labels are the hardware acceptance target.
+
+`ble_client.py` remains a PING/PONG diagnostic. Use `ble_bridge.py` for menus.
+
+Automated Linux checks (requires gcc for the real C receiver test):
+
+```sh
+python -m unittest discover -p 'test_*.py' -v
 ```
 
-Environment variables are per-terminal: set the same token in the second terminal, or run the requests in the same terminal using `Start-Process` to launch the server.
-
-## Tasks
-
-Edit `tasks.json` to add explicit allowed tasks with `argv` arrays, and optionally `cwd`. There is **no arbitrary shell endpoint** and requests cannot override arguments. `wsl_python_demo` is an example of launching WSL Python. Codex tasks will be added only after defining explicit project directory and lifecycle semantics.
-
-## Network / security
-
-For first testing, keep the server on loopback. For LAN pairing later, set `PC_REMOTE_HOST=0.0.0.0` only on a trusted private network, allow Windows Firewall only on the private profile, and use a unique secret. HTTP plus a static token is **not encrypted**, so this is not suitable for hostile Wi-Fi or public networks. Do not forward port 8765 to the internet. A pairing and stronger transport mechanism is required before general deployment.
-
-## API
-
-- `GET /status`: service and job status
-- `GET /tasks`: task names
-- `POST /run`: JSON `{"task":"open_notepad"}`
-- All endpoints require `X-PC-Remote-Token`.
-
-This slice does not implement Codex pause/resume, interactive terminal streaming, device discovery, or Cardputer menu yet.
+Hardware acceptance still required: menu arrival, both task selections, disconnect/reconnect, G0, and the original BLE keyboard after reboot.

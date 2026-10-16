@@ -1,4 +1,7 @@
 #include "pc_remote_ble.h"
+#include "pc_frame.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include <string.h>
 #include <stdio.h>
 #include "esp_log.h"
@@ -9,6 +12,8 @@
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
 
+static pc_frame_rx_t menu_rx;
+static QueueHandle_t menu_queue;
 static const char *TAG = "PC_REMOTE_BLE";
 static uint8_t own_addr_type;
 static uint16_t conn_handle = BLE_HS_CONN_HANDLE_NONE;
@@ -32,9 +37,21 @@ static int access_cb(uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt *
 {
     (void)attr; (void)arg;
     if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
-        if (OS_MBUF_PKTLEN(ctxt->om) > 32) return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
-        char input[33] = {0};
-        if (ble_hs_mbuf_to_flat(ctxt->om, input, sizeof(input), NULL)) return BLE_ATT_ERR_UNLIKELY;
+        size_t size = OS_MBUF_PKTLEN(ctxt->om);
+        if (size > PC_FRAME_HEADER_SIZE + PC_FRAME_MAX_CHUNK) return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+        char input[PC_FRAME_HEADER_SIZE + PC_FRAME_MAX_CHUNK + 1] = {0};
+        if (ble_hs_mbuf_to_flat(ctxt->om, input, size, NULL)) return BLE_ATT_ERR_UNLIKELY;
+        if (size && (uint8_t)input[0] == 2) {
+            int result = pc_frame_feed(&menu_rx, (uint8_t *)input, size);
+            if (result < 0) return BLE_ATT_ERR_VALUE_NOT_ALLOWED;
+            if (result == 1) {
+                if (menu_rx.kind != 2) return BLE_ATT_ERR_VALUE_NOT_ALLOWED;
+                if (xQueueSend(menu_queue, &menu_rx, 0) != pdTRUE)
+                    return BLE_ATT_ERR_INSUFFICIENT_RES;
+                pc_frame_reset(&menu_rx);
+            }
+            return 0;
+        }
         if (memcmp(input, "PING", 4) != 0) {
             unsigned int seq = 0;
             char status[8] = {0};
@@ -110,6 +127,8 @@ static int gap_event(struct ble_gap_event *event, void *arg)
     case BLE_GAP_EVENT_DISCONNECT:
         conn_handle = BLE_HS_CONN_HANDLE_NONE;
         notify_enabled = false;
+        pc_frame_reset(&menu_rx);
+        xQueueReset(menu_queue);
         pending_seq = 0;
         command_state = 0;
         advertise();
@@ -137,6 +156,8 @@ static void host_task(void *arg)
 int pc_remote_ble_start(void)
 {
     if (started) return 0;
+    menu_queue = xQueueCreate(16, sizeof(pc_frame_rx_t));
+    if (!menu_queue) return -1;
     int rc = nimble_port_init();
     if (rc) { last_error = rc; return rc; }
     ble_svc_gap_init();
@@ -156,14 +177,14 @@ int pc_remote_ble_connected(void) { return conn_handle != BLE_HS_CONN_HANDLE_NON
 int pc_remote_ble_ping_count(void) { return ping_count; }
 int pc_remote_ble_last_error(void) { return last_error; }
 
-int pc_remote_ble_send_notepad(void)
+int pc_remote_ble_send_task(unsigned int index)
 {
     if (conn_handle == BLE_HS_CONN_HANDLE_NONE || !notify_enabled) return -1;
     if (pending_seq != 0) return -2;
     unsigned int seq = next_seq++;
     if (next_seq > 999999) next_seq = 1;
     char frame[32];
-    int len = snprintf(frame, sizeof(frame), "RUN:NOTEPAD:%u", seq);
+    int len = snprintf(frame, sizeof(frame), "RUN:%u:%u", index, seq);
     if (len <= 0 || len >= (int)sizeof(frame)) return -3;
     pending_seq = seq;
     command_state = 1;
@@ -174,3 +195,14 @@ int pc_remote_ble_send_notepad(void)
     return rc;
 }
 int pc_remote_ble_command_state(void) { return command_state; }
+
+
+int pc_remote_ble_take_menu(char *out, size_t capacity)
+{
+    pc_frame_rx_t message;
+    if (!menu_queue || xQueueReceive(menu_queue, &message, 0) != pdTRUE) return 0;
+    if (capacity <= message.received) return -1;
+    memcpy(out, message.buffer, message.received);
+    out[message.received] = 0;
+    return message.received;
+}

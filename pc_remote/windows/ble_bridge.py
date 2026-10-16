@@ -1,77 +1,78 @@
-"""Cardputer PC Remote BLE bridge: allowlisted Windows tasks only."""
+"""Upload Windows-owned menus and execute explicit allowlisted task selections."""
 import asyncio
 import json
 import os
-import urllib.error
 import urllib.request
-from bleak import BleakClient, BleakScanner
+from bridge_session import BridgeSession, frames_for_catalog
 
-SERVICE_UUID = "7cbf1000-8c22-4b2d-9c2e-ae8f2bc4a100"
-WRITE_UUID = "7cbf1001-8c22-4b2d-9c2e-ae8f2bc4a100"
-NOTIFY_UUID = "7cbf1002-8c22-4b2d-9c2e-ae8f2bc4a100"
-TOKEN = os.environ.get("PC_REMOTE_TOKEN", "")
-BASE = "http://127.0.0.1:8765"
-SEEN = set()
+SERVICE_UUID = '7cbf1000-8c22-4b2d-9c2e-ae8f2bc4a100'
+WRITE_UUID = '7cbf1001-8c22-4b2d-9c2e-ae8f2bc4a100'
+NOTIFY_UUID = '7cbf1002-8c22-4b2d-9c2e-ae8f2bc4a100'
+BASE = 'http://127.0.0.1:8765'
 
-def execute_notepad():
-    req = urllib.request.Request(
-        BASE + "/run",
-        data=json.dumps({"task": "open_notepad"}).encode("utf-8"),
-        headers={"Content-Type": "application/json", "X-PC-Remote-Token": TOKEN},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=5) as res:
-            return bool(json.load(res).get("ok"))
-    except (urllib.error.URLError, ValueError, TimeoutError) as exc:
-        print("Windows task failed:", exc)
-        return False
 
-async def run_once():
-    print("Scanning for Cardputer-PCRemote...")
-    found = await BleakScanner.discover(timeout=10, return_adv=True)
-    devices = [dev for dev, adv in found.values()
-               if dev.name == "Cardputer-PCRemote" or
-               SERVICE_UUID.lower() in [u.lower() for u in adv.service_uuids]]
-    if not devices:
-        print("Device not found")
+def request(path, token, data=None):
+    body = None if data is None else json.dumps(data).encode()
+    req = urllib.request.Request(BASE + path, data=body, headers={
+        'Content-Type': 'application/json', 'X-PC-Remote-Token': token})
+    with urllib.request.urlopen(req, timeout=5) as response:
+        return json.load(response)
+
+
+async def run_once(token):
+    from bleak import BleakClient, BleakScanner
+    # Read from the running server, so displayed IDs and execution share one catalog.
+    catalog = await asyncio.to_thread(request, '/catalog', token)
+    entries = catalog['menu']
+    print('Scanning for Cardputer-PCRemote...')
+    device = await BleakScanner.find_device_by_filter(
+        lambda dev, adv: dev.name == 'Cardputer-PCRemote' or
+        SERVICE_UUID in [u.lower() for u in adv.service_uuids], timeout=10)
+    if device is None:
+        print('Device not found; open PC Remote on the Cardputer.')
         return
-    async with BleakClient(devices[0], timeout=20) as client:
-        print("Connected. Press 1 on Cardputer.")
+    disconnected = asyncio.Event()
+    async with BleakClient(device, timeout=20,
+                           disconnected_callback=lambda _: disconnected.set()) as client:
         queue = asyncio.Queue()
-        def on_notify(_, data):
-            queue.put_nowait(bytes(data).decode("ascii", errors="replace"))
-        await client.start_notify(NOTIFY_UUID, on_notify)
-        while client.is_connected:
+        await client.start_notify(NOTIFY_UUID, lambda _, data: queue.put_nowait(bytes(data)))
+        chunk_size = min(120, client.mtu_size - 3 - 8)
+        frames = frames_for_catalog(entries, chunk_size)
+        for frame in frames:
+            await client.write_gatt_char(WRITE_UUID, frame, response=True)
+        print(f'Menu sent: {len(entries)} tasks. Use Up/Down and Enter on Cardputer.')
+
+        async def execute(task_id):
             try:
-                frame = await asyncio.wait_for(queue.get(), timeout=2)
+                result = await asyncio.to_thread(request, '/run', token, {'task': task_id})
+                print('Task:', task_id, result)
+                return bool(result.get('ok'))
+            except Exception as exc:
+                print('Task failed:', exc)
+                return False
+
+        session = BridgeSession(entries, execute)
+        while not disconnected.is_set():
+            try:
+                data = await asyncio.wait_for(queue.get(), timeout=1)
             except asyncio.TimeoutError:
                 continue
-            print("Received:", frame)
-            if not frame.startswith("RUN:NOTEPAD:"):
-                continue
-            seq = frame.removeprefix("RUN:NOTEPAD:")
-            if not seq.isdecimal() or len(seq) > 6:
-                continue
-            if seq in SEEN:
-                print("Duplicate request ignored:", seq)
-                continue
-            SEEN.add(seq)
-            success = await asyncio.to_thread(execute_notepad)
-            response = f"ACK:{seq}:{'OK' if success else 'ERR'}"
-            await client.write_gatt_char(WRITE_UUID, response.encode("ascii"), response=True)
-            print("Sent:", response)
+            reply = await session.handle(data)
+            if reply:
+                await client.write_gatt_char(WRITE_UUID, reply, response=True)
+
 
 async def main():
-    if not TOKEN:
-        raise SystemExit("Set PC_REMOTE_TOKEN before running BLE bridge.")
+    token = os.environ.get('PC_REMOTE_TOKEN', '')
+    if not token:
+        raise SystemExit('Set PC_REMOTE_TOKEN to the same value used by server.py.')
     while True:
         try:
-            await run_once()
+            await run_once(token)
         except Exception as exc:
-            print("BLE disconnected or failed:", repr(exc))
-        print("Retrying discovery in 3 seconds...")
+            print('Bridge failed:', repr(exc))
         await asyncio.sleep(3)
 
-if __name__ == "__main__":
+
+if __name__ == '__main__':
     asyncio.run(main())
