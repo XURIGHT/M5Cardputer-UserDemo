@@ -1,8 +1,8 @@
-name: Build Cardputer ADV Silent Firmware
+name: Build Cardputer ADV Firmware
 
 on:
   push:
-    branches: [CardputerADV]
+    branches: [CardputerADV, 'feature/pc-remote-ble']
   workflow_dispatch:
 
 permissions:
@@ -25,7 +25,7 @@ jobs:
       - name: Upload firmware and flash instructions
         uses: actions/upload-artifact@v4
         with:
-          name: Cardputer-ADV-silent-firmware
+          name: Cardputer-ADV-firmware
           if-no-files-found: error
           path: |
             build/*.bin
