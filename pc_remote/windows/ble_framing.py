@@ -53,7 +53,9 @@ class Reassembler:
             raise ProtocolError("invalid frame")
         key = (kind, msg_id, count)
         if index == 0:
-            self.reset()
+            if self.key is not None:
+                self.reset()
+                raise ProtocolError("new message before previous completed")
             self.key = key
             self.expected_length = length
         if self.key != key or index != len(self.parts) or length != self.expected_length:
