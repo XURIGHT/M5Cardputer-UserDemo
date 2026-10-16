@@ -1,5 +1,6 @@
 #include "pc_remote_ble.h"
 #include <string.h>
+#include <stdio.h>
 #include "esp_log.h"
 #include "host/ble_hs.h"
 #include "host/ble_uuid.h"
@@ -15,6 +16,10 @@ static uint16_t notify_handle;
 static volatile int ping_count;
 static volatile int last_error;
 static bool started;
+static volatile bool notify_enabled;
+static unsigned int next_seq = 1;
+static volatile unsigned int pending_seq;
+static volatile int command_state;
 
 static const ble_uuid128_t service_uuid = BLE_UUID128_INIT(
     0x00,0xa1,0xc4,0x2b,0x8f,0xae,0x2e,0x9c,0x2d,0x4b,0x22,0x8c,0x00,0x10,0xbf,0x7c);
@@ -27,10 +32,21 @@ static int access_cb(uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt *
 {
     (void)attr; (void)arg;
     if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
-        if (OS_MBUF_PKTLEN(ctxt->om) != 4) return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
-        char input[4];
+        if (OS_MBUF_PKTLEN(ctxt->om) > 32) return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+        char input[33] = {0};
         if (ble_hs_mbuf_to_flat(ctxt->om, input, sizeof(input), NULL)) return BLE_ATT_ERR_UNLIKELY;
-        if (memcmp(input, "PING", 4) != 0) return BLE_ATT_ERR_VALUE_NOT_ALLOWED;
+        if (memcmp(input, "PING", 4) != 0) {
+            unsigned int seq = 0;
+            char status[8] = {0};
+            if (sscanf(input, "ACK:%u:%7s", &seq, status) == 2 &&
+                pending_seq != 0 && seq == pending_seq) {
+                command_state = strcmp(status, "OK") == 0 ? 2 : 3;
+                pending_seq = 0;
+                return 0;
+            }
+            return BLE_ATT_ERR_VALUE_NOT_ALLOWED;
+        }
+        if (OS_MBUF_PKTLEN(ctxt->om) != 4) return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
         ping_count++;
         if (conn_handle == conn && notify_handle) {
             struct os_mbuf *om = ble_hs_mbuf_from_flat("PONG", 4);
@@ -88,12 +104,19 @@ static int gap_event(struct ble_gap_event *event, void *arg)
     (void)arg;
     switch (event->type) {
     case BLE_GAP_EVENT_CONNECT:
-        if (event->connect.status == 0) conn_handle = event->connect.conn_handle;
+        if (event->connect.status == 0) { conn_handle = event->connect.conn_handle; notify_enabled = false; pending_seq = 0; command_state = 0; }
         else advertise();
         break;
     case BLE_GAP_EVENT_DISCONNECT:
         conn_handle = BLE_HS_CONN_HANDLE_NONE;
+        notify_enabled = false;
+        pending_seq = 0;
+        command_state = 0;
         advertise();
+        break;
+    case BLE_GAP_EVENT_SUBSCRIBE:
+        if (event->subscribe.attr_handle == notify_handle)
+            notify_enabled = event->subscribe.cur_notify != 0;
         break;
     default: break;
     }
@@ -132,3 +155,22 @@ int pc_remote_ble_start(void)
 int pc_remote_ble_connected(void) { return conn_handle != BLE_HS_CONN_HANDLE_NONE; }
 int pc_remote_ble_ping_count(void) { return ping_count; }
 int pc_remote_ble_last_error(void) { return last_error; }
+
+int pc_remote_ble_send_notepad(void)
+{
+    if (conn_handle == BLE_HS_CONN_HANDLE_NONE || !notify_enabled) return -1;
+    if (pending_seq != 0) return -2;
+    unsigned int seq = next_seq++;
+    if (next_seq > 999999) next_seq = 1;
+    char frame[32];
+    int len = snprintf(frame, sizeof(frame), "RUN:NOTEPAD:%u", seq);
+    if (len <= 0 || len >= (int)sizeof(frame)) return -3;
+    pending_seq = seq;
+    command_state = 1;
+    struct os_mbuf *om = ble_hs_mbuf_from_flat(frame, len);
+    if (!om) { pending_seq = 0; command_state = 3; return -4; }
+    int rc = ble_gatts_notify_custom(conn_handle, notify_handle, om);
+    if (rc) { last_error = rc; pending_seq = 0; command_state = 3; }
+    return rc;
+}
+int pc_remote_ble_command_state(void) { return command_state; }
