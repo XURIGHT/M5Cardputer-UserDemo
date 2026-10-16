@@ -59,6 +59,12 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json(200, {"ok": True, "service": "pc-remote-v0.1", "jobs": jobs})
         if self.path == "/tasks":
             return self.send_json(200, {"ok": True, "tasks": list(TASKS)})
+        if self.path == "/catalog":
+            catalog = [{"id": task_id,
+                        "label": spec.get("label", task_id),
+                        "category": spec.get("category", "Other")}
+                       for task_id, spec in TASKS.items()]
+            return self.send_json(200, {"ok": True, "version": 2, "menu": catalog})
         self.send_json(404, {"ok": False, "error": "not_found"})
 
     def do_POST(self):
