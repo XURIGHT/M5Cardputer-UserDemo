@@ -1,7 +1,6 @@
 #include "pc_remote_ble.h"
 #include <string.h>
 #include "esp_log.h"
-#include "esp_nimble_hci.h"
 #include "host/ble_hs.h"
 #include "host/ble_uuid.h"
 #include "nimble/nimble_port.h"
@@ -115,9 +114,7 @@ static void host_task(void *arg)
 int pc_remote_ble_start(void)
 {
     if (started) return 0;
-    int rc = esp_nimble_hci_and_controller_init();
-    if (rc) { last_error = rc; return rc; }
-    rc = nimble_port_init();
+    int rc = nimble_port_init();
     if (rc) { last_error = rc; return rc; }
     ble_svc_gap_init();
     ble_svc_gatt_init();
