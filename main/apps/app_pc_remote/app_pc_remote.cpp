@@ -2,6 +2,7 @@
 #include "pc_remote_ble.h"
 #include "cJSON.h"
 #include <cstring>
+#include <algorithm>
 #include <hal.h>
 #include <apps/utils/theme.h>
 #include <apps/utils/common.h>
@@ -75,27 +76,32 @@ void AppPcRemote::onRunning()
         last_draw_ = GetHAL().millis();
         auto &screen = GetHAL().canvas;
         screen.fillScreen(THEME_COLOR_BG);
-        screen.setCursor(0, 0);
         screen.setTextSize(1);
+        screen.setTextWrap(false);  // Long labels must not create hidden rows.
+        const int line = screen.fontHeight();
+        const int rows = std::max(1, std::min(3, (screen.height() - 3 * line) / line));
+        screen.setCursor(0, 0);
         screen.setTextColor(TFT_CYAN, THEME_COLOR_BG);
-        screen.println("PC Remote BLE");
-        screen.setTextColor(TFT_WHITE, THEME_COLOR_BG);
-        screen.println(pc_remote_ble_connected() ? "Connected" : "Advertising...");
-        screen.printf("PING count: %d\n", pc_remote_ble_ping_count());
-        screen.printf("BLE error: %d\n", pc_remote_ble_last_error());
-        if (!ready_) screen.println("Waiting for Windows menu...");
-        else if (!count_) screen.println("No tasks configured");
-        else {
-            int first = (selected_ / 3) * 3;
-            for (int i = first; i < count_ && i < first + 3; ++i)
-                screen.printf("%c %.30s\n", i == selected_ ? '>' : ' ', labels_[i]);
-        }
-        screen.println("Up/Down Select  Enter Run");
+        screen.print(pc_remote_ble_connected() ? "PC Remote: Connected" : "PC Remote: Waiting");
         int state = pc_remote_ble_command_state();
-        screen.println(state == 1 ? "Waiting for PC..." :
-                       state == 2 ? "Result: OK" :
-                       state == 3 ? "Result: ERROR" : "Ready");
-        screen.println("G0: back (reboot)");
+        screen.setCursor(0, line);
+        screen.setTextColor(state == 2 ? TFT_GREEN : TFT_WHITE, THEME_COLOR_BG);
+        screen.print(state == 1 ? "Waiting for PC..." :
+                     state == 2 ? "Result: OK" :
+                     state == 3 ? "Result: ERROR" : "Ready");
+        screen.setTextColor(TFT_WHITE, THEME_COLOR_BG);
+        screen.setCursor(0, 2 * line);
+        if (!ready_) screen.print("Waiting for menu...");
+        else if (!count_) screen.print("No tasks configured");
+        else {
+            int first = (selected_ / rows) * rows;
+            for (int i = first; i < count_ && i < first + rows; ++i) {
+                screen.setCursor(0, (2 + i - first) * line);
+                screen.printf("%c %s", i == selected_ ? '>' : ' ', labels_[i]);
+            }
+        }
+        screen.setCursor(0, screen.height() - line);
+        screen.print("Up/Down Enter G0");
         GetHAL().pushCanvas();
     }
     if (GetHAL().homeButton.wasClicked()) close();
