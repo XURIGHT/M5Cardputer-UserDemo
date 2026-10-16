@@ -9,4 +9,5 @@ public:
     void onClose() override;
 private:
     unsigned long last_draw_ = 0;
+    int key_slot_ = -1;
 };
