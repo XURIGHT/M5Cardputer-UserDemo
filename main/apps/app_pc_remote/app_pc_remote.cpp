@@ -5,6 +5,7 @@
 #include <apps/utils/common.h>
 #include <assets.h>
 #include <esp_system.h>
+#include <hal/keyboard/keyboard.h>
 #include <apps/app_keyboard/assets/keyboard_big.h>
 #include <apps/app_keyboard/assets/keyboard_small.h>
 
@@ -21,6 +22,12 @@ void AppPcRemote::onOpen()
 {
     pc_remote_ble_start();
     last_draw_ = 0;
+    key_slot_ = GetHAL().keyboard.onKeyEvent.connect([this](const Keyboard::KeyEvent_t& ev) {
+        if (ev.state && !ev.isModifier && ev.keyCode == KEY_1) {
+            pc_remote_ble_send_notepad();
+            last_draw_ = 0;
+        }
+    });
 }
 void AppPcRemote::onRunning()
 {
@@ -36,6 +43,11 @@ void AppPcRemote::onRunning()
         screen.println(pc_remote_ble_connected() ? "Connected" : "Advertising...");
         screen.printf("PING count: %d\n", pc_remote_ble_ping_count());
         screen.printf("BLE error: %d\n", pc_remote_ble_last_error());
+        screen.println("1: Open Notepad");
+        int state = pc_remote_ble_command_state();
+        screen.println(state == 1 ? "Waiting for PC..." :
+                       state == 2 ? "Result: OK" :
+                       state == 3 ? "Result: ERROR" : "Ready");
         screen.println("G0: back (reboot)");
         GetHAL().pushCanvas();
     }
@@ -45,5 +57,6 @@ void AppPcRemote::onClose()
 {
     // Matches existing BLE keyboard lifecycle: reboot ensures BLE host is
     // fully reset before the launcher or HID keyboard can be used again.
+    if (key_slot_ >= 0) GetHAL().keyboard.onKeyEvent.disconnect(key_slot_);
     esp_restart();
 }
