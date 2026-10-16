@@ -79,7 +79,7 @@ void AppPcRemote::onRunning()
         screen.setTextSize(1);
         screen.setTextWrap(false);  // Long labels must not create hidden rows.
         const int line = screen.fontHeight();
-        const int rows = std::max(1, std::min(3, (screen.height() - 3 * line) / line));
+        const int rows = std::max(1, std::min(3, (static_cast<int>(screen.height()) - 3 * line) / line));
         screen.setCursor(0, 0);
         screen.setTextColor(TFT_CYAN, THEME_COLOR_BG);
         screen.print(pc_remote_ble_connected() ? "PC Remote: Connected" : "PC Remote: Waiting");
@@ -113,4 +113,5 @@ void AppPcRemote::onClose()
     if (key_slot_ >= 0) GetHAL().keyboard.onKeyEvent.disconnect(key_slot_);
     esp_restart();
 }
+
 
