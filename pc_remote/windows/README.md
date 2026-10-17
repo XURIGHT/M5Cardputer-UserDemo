@@ -1,5 +1,14 @@
 # PC Remote dynamic menu
 
+## Double-click startup
+
+Place `Start-PC-Remote.cmd` and `start_pc_remote.py` beside the existing Windows Python files and your `tasks.json`. Double-click `Start-PC-Remote.cmd`. One window named **PC Remote - Bluetooth + Tasks** runs both the HTTP service and BLE bridge, generates a shared session token, and reconnects automatically. No PowerShell commands or manually copied token are needed. Keep the window open; press Ctrl+C or close it to stop. Double-click again to reload edited task configuration. Existing application tasks (for example Notepad) are left running when the launcher stops.
+
+On the first transition, stop the old manually started server/bridge before using this entry point. If port 8765 is occupied, the launcher displays a clear message and never kills an existing process. Subsequent starts need only this one launcher. The current task configuration is preserved, including customized WSL demo commands.
+
+The launcher lifecycle, shared HTTP authorization and occupied-port handling are tested on Linux. Windows double-click/title behavior and BLE require hardware verification.
+
+
 Windows owns the task catalog. Cardputer receives it over BLE, displays three rows at a time, and sends the selected index when Enter is pressed. Up/Down select; G0 returns by rebooting, matching the existing BLE lifecycle.
 
 ## Windows setup after flashing the new firmware
