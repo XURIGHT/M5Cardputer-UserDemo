@@ -33,7 +33,18 @@ static size_t text_length, text_offset;
 static uint8_t text_part, text_parts;
 static unsigned int text_seq;
 static TickType_t pending_since, last_chunk;
-static volatile bool text_active;
+static bool text_active;
+// Shared by the NimBLE host task and the UI task. Every state transition is
+// protected together; volatile alone does not synchronize the two tasks.
+static portMUX_TYPE state_lock = portMUX_INITIALIZER_UNLOCKED;
+static uint32_t connection_generation;
+
+static void set_last_error(int value)
+{
+    portENTER_CRITICAL(&state_lock);
+    last_error = value;
+    portEXIT_CRITICAL(&state_lock);
+}
 
 static const ble_uuid128_t service_uuid = BLE_UUID128_INIT(
     0x00,0xa1,0xc4,0x2b,0x8f,0xae,0x2e,0x9c,0x2d,0x4b,0x22,0x8c,0x00,0x10,0xbf,0x7c);
@@ -69,22 +80,28 @@ static int access_cb(uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt *
                 consumed != (int)size || seq == 0 || seq > 65535 ||
                 (strcmp(status, "OK") != 0 && strcmp(status, "ERR") != 0 &&
                  strcmp(status, "UNKNOWN") != 0)) return BLE_ATT_ERR_VALUE_NOT_ALLOWED;
-            if (pending_seq != 0 && seq == pending_seq) {
+            portENTER_CRITICAL(&state_lock);
+            if (conn == conn_handle && pending_seq != 0 && seq == pending_seq) {
                 command_state = strcmp(status, "OK") == 0 ? 2 :
                     strcmp(status, "UNKNOWN") == 0 ? 4 : 3;
                 pending_seq = 0;
+                text_active = false;
             }
+            portEXIT_CRITICAL(&state_lock);
             // A delayed/duplicate receipt must not overwrite a newer request,
             // or tear down BLE after the UI's timeout. UNKNOWN remains UNKNOWN.
             return 0;
         }
         if (OS_MBUF_PKTLEN(ctxt->om) != 4) return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+        portENTER_CRITICAL(&state_lock);
         ping_count++;
-        if (conn_handle == conn && notify_handle) {
+        bool ping_current = conn_handle == conn;
+        portEXIT_CRITICAL(&state_lock);
+        if (ping_current && notify_handle) {
             struct os_mbuf *om = ble_hs_mbuf_from_flat("PONG", 4);
             if (om) {
                 int rc = ble_gatts_notify_custom(conn, notify_handle, om);
-                if (rc) last_error = rc;
+                if (rc) set_last_error(rc);
             }
         }
         return 0;
@@ -115,7 +132,7 @@ static void advertise(void)
     fields.num_uuids128 = 1;
     fields.uuids128_is_complete = 1;
     int rc = ble_gap_adv_set_fields(&fields);
-    if (rc) { last_error = rc; return; }
+    if (rc) { set_last_error(rc); return; }
 
     struct ble_hs_adv_fields scan = {0};
     const char *name = "Cardputer-PCRemote";
@@ -123,35 +140,53 @@ static void advertise(void)
     scan.name_len = strlen(name);
     scan.name_is_complete = 1;
     rc = ble_gap_adv_rsp_set_fields(&scan);
-    if (rc) { last_error = rc; return; }
+    if (rc) { set_last_error(rc); return; }
 
     struct ble_gap_adv_params params = {0};
     params.conn_mode = BLE_GAP_CONN_MODE_UND;
     params.disc_mode = BLE_GAP_DISC_MODE_GEN;
     rc = ble_gap_adv_start(own_addr_type, NULL, BLE_HS_FOREVER, &params, gap_event, NULL);
-    if (rc) last_error = rc;
+    if (rc) set_last_error(rc);
 }
 static int gap_event(struct ble_gap_event *event, void *arg)
 {
     (void)arg;
     switch (event->type) {
     case BLE_GAP_EVENT_CONNECT:
-        if (event->connect.status == 0) { conn_handle = event->connect.conn_handle; notify_enabled = false; text_active = false; next_seq = 1; pending_seq = 0; command_state = command_state == 1 ? 4 : command_state; }
-        else advertise();
+        if (event->connect.status == 0) {
+            portENTER_CRITICAL(&state_lock);
+            ++connection_generation;
+            conn_handle = event->connect.conn_handle;
+            notify_enabled = false;
+            text_active = false;
+            // Never reuse a request sequence during this firmware run. A
+            // stale notification sent across a reconnect cannot be mistaken
+            // for the next request's receipt, even if the handle is reused.
+            pending_seq = 0;
+            if (command_state == 1) command_state = 4;
+            portEXIT_CRITICAL(&state_lock);
+        } else advertise();
         break;
     case BLE_GAP_EVENT_DISCONNECT:
+        portENTER_CRITICAL(&state_lock);
+        ++connection_generation;
         text_active = false;
         conn_handle = BLE_HS_CONN_HANDLE_NONE;
         notify_enabled = false;
-        pc_frame_reset(&menu_rx);
-        xQueueReset(menu_queue);
         pending_seq = 0;
         if (command_state == 1) command_state = 4;
+        portEXIT_CRITICAL(&state_lock);
+        pc_frame_reset(&menu_rx);
+        xQueueReset(menu_queue);
         advertise();
         break;
     case BLE_GAP_EVENT_SUBSCRIBE:
-        if (event->subscribe.attr_handle == notify_handle)
-            notify_enabled = event->subscribe.cur_notify != 0;
+        if (event->subscribe.attr_handle == notify_handle) {
+            portENTER_CRITICAL(&state_lock);
+            if (event->subscribe.conn_handle == conn_handle)
+                notify_enabled = event->subscribe.cur_notify != 0;
+            portEXIT_CRITICAL(&state_lock);
+        }
         break;
     default: break;
     }
@@ -160,7 +195,7 @@ static int gap_event(struct ble_gap_event *event, void *arg)
 static void on_sync(void)
 {
     int rc = ble_hs_id_infer_auto(0, &own_addr_type);
-    if (rc) { last_error = rc; return; }
+    if (rc) { set_last_error(rc); return; }
     advertise();
 }
 static void host_task(void *arg)
@@ -175,97 +210,152 @@ int pc_remote_ble_start(void)
     menu_queue = xQueueCreate(16, sizeof(pc_frame_rx_t));
     if (!menu_queue) return -1;
     int rc = nimble_port_init();
-    if (rc) { last_error = rc; return rc; }
+    if (rc) { set_last_error(rc); return rc; }
     ble_svc_gap_init();
     ble_svc_gatt_init();
     rc = ble_gatts_count_cfg(services);
     if (!rc) rc = ble_gatts_add_svcs(services);
-    if (rc) { last_error = rc; return rc; }
+    if (rc) { set_last_error(rc); return rc; }
     rc = ble_svc_gap_device_name_set("Cardputer-PCRemote");
-    if (rc) { last_error = rc; return rc; }
+    if (rc) { set_last_error(rc); return rc; }
     ble_hs_cfg.sync_cb = on_sync;
     nimble_port_freertos_init(host_task);
     started = true;
     ESP_LOGI(TAG, "PC Remote BLE started");
     return 0;
 }
-int pc_remote_ble_connected(void) { return conn_handle != BLE_HS_CONN_HANDLE_NONE; }
-int pc_remote_ble_ping_count(void) { return ping_count; }
-int pc_remote_ble_last_error(void) { return last_error; }
+int pc_remote_ble_connected(void)
+{
+    portENTER_CRITICAL(&state_lock);
+    int connected = conn_handle != BLE_HS_CONN_HANDLE_NONE;
+    portEXIT_CRITICAL(&state_lock);
+    return connected;
+}
+int pc_remote_ble_ping_count(void)
+{
+    portENTER_CRITICAL(&state_lock);
+    int value = ping_count;
+    portEXIT_CRITICAL(&state_lock);
+    return value;
+}
+int pc_remote_ble_last_error(void)
+{
+    portENTER_CRITICAL(&state_lock);
+    int value = last_error;
+    portEXIT_CRITICAL(&state_lock);
+    return value;
+}
 
 int pc_remote_ble_send_task(unsigned int index)
 {
-    if (conn_handle == BLE_HS_CONN_HANDLE_NONE || !notify_enabled) { command_state = 3; return -1; }
-    if (pending_seq != 0) return -2;
-    if (next_seq > 65535) { command_state = 5; return -5; }
+    TickType_t now = xTaskGetTickCount();
+    portENTER_CRITICAL(&state_lock);
+    if (conn_handle == BLE_HS_CONN_HANDLE_NONE || !notify_enabled) {
+        command_state = 3; portEXIT_CRITICAL(&state_lock); return -1;
+    }
+    if (pending_seq != 0) { portEXIT_CRITICAL(&state_lock); return -2; }
+    if (next_seq > 65535) { command_state = 5; portEXIT_CRITICAL(&state_lock); return -5; }
     unsigned int seq = next_seq++;
-    char frame[32];
-    int len = snprintf(frame, sizeof(frame), "RUN:%u:%u", index, seq);
-    if (len <= 0 || len >= (int)sizeof(frame)) return -3;
-    pending_since = xTaskGetTickCount();
+    uint16_t connection = conn_handle;
+    uint32_t generation = connection_generation;
+    pending_since = now;
     pending_seq = seq;
     command_state = 1;
-    struct os_mbuf *om = ble_hs_mbuf_from_flat(frame, len);
-    if (!om) { pending_seq = 0; command_state = 3; return -4; }
-    int rc = ble_gatts_notify_custom(conn_handle, notify_handle, om);
-    if (rc) { last_error = rc; pending_seq = 0; command_state = 3; }
+    portEXIT_CRITICAL(&state_lock);
+    char frame[32];
+    int len = snprintf(frame, sizeof(frame), "RUN:%u:%u", index, seq);
+    struct os_mbuf *om = len > 0 && len < (int)sizeof(frame) ? ble_hs_mbuf_from_flat(frame, len) : NULL;
+    int rc = om ? ble_gatts_notify_custom(connection, notify_handle, om) : -4;
+    if (rc) {
+        portENTER_CRITICAL(&state_lock);
+        if (connection_generation == generation && conn_handle == connection && pending_seq == seq) {
+            last_error = rc; pending_seq = 0; command_state = 3;
+        }
+        portEXIT_CRITICAL(&state_lock);
+    }
     return rc;
 }
 int pc_remote_ble_send_text(unsigned int index, const char *text, size_t length)
 {
-    if (conn_handle == BLE_HS_CONN_HANDLE_NONE || !notify_enabled) {
-        command_state = 3; return -1;
-    }
-    if (pending_seq || text_active) return -2;
     if (index >= 64 || !text || length == 0 || length > 512) {
-        command_state = 3; return -3;
+        portENTER_CRITICAL(&state_lock); command_state = 3; portEXIT_CRITICAL(&state_lock); return -3;
     }
     for (size_t i = 0; i < length; ++i)
         if ((unsigned char)text[i] < 0x20 || (unsigned char)text[i] > 0x7e) {
-            command_state = 3; return -3;
+            portENTER_CRITICAL(&state_lock); command_state = 3; portEXIT_CRITICAL(&state_lock); return -3;
         }
-    if (next_seq > 65535) { command_state = 5; return -5; }
+    TickType_t now = xTaskGetTickCount();
+    portENTER_CRITICAL(&state_lock);
+    if (conn_handle == BLE_HS_CONN_HANDLE_NONE || !notify_enabled) {
+        command_state = 3; portEXIT_CRITICAL(&state_lock); return -1;
+    }
+    if (pending_seq || text_active) { portEXIT_CRITICAL(&state_lock); return -2; }
+    if (next_seq > 65535) { command_state = 5; portEXIT_CRITICAL(&state_lock); return -5; }
     text_seq = next_seq++;
     text_body[0] = (uint8_t)index;
     memcpy(text_body + 1, text, length);
     text_length = length + 1;
     text_offset = 0; text_part = 0;
     text_parts = (uint8_t)((text_length + 11) / 12);
-    pending_since = last_chunk = xTaskGetTickCount();
+    pending_since = last_chunk = now;
     pending_seq = text_seq;
     command_state = 1; text_active = true;
+    portEXIT_CRITICAL(&state_lock);
     return 0;
 }
 
 void pc_remote_ble_poll(void)
 {
     TickType_t now = xTaskGetTickCount();
-    if (!pending_seq) { text_active = false; return; }
+    uint8_t frame[20];
+    size_t chunk;
+    uint16_t connection;
+    uint32_t generation;
+    unsigned int seq;
+    portENTER_CRITICAL(&state_lock);
+    if (!pending_seq) { text_active = false; portEXIT_CRITICAL(&state_lock); return; }
     if (now - pending_since >= pdMS_TO_TICKS(15000)) {
-        // The sink may already have received the text. Never claim failure or retry.
-        pending_seq = 0; text_active = false; command_state = 4; return;
+        pending_seq = 0; text_active = false; command_state = 4;
+        portEXIT_CRITICAL(&state_lock); return;
     }
-    if (!text_active || now - last_chunk < pdMS_TO_TICKS(30)) return;
-    if (!pc_remote_ble_connected() || !notify_enabled) {
-        pending_seq = 0; text_active = false; command_state = 4; return;
+    if (!text_active || now - last_chunk < pdMS_TO_TICKS(30)) {
+        portEXIT_CRITICAL(&state_lock); return;
     }
-    size_t chunk = text_length - text_offset;
-    if (chunk > 12) chunk = 12; // MTU 23 minus ATT 3 minus header 8.
-    uint8_t frame[20] = {2, 3, (uint8_t)(text_seq >> 8), (uint8_t)text_seq,
-        text_part, text_parts, (uint8_t)(text_length >> 8), (uint8_t)text_length};
+    if (conn_handle == BLE_HS_CONN_HANDLE_NONE || !notify_enabled) {
+        pending_seq = 0; text_active = false; command_state = 4;
+        portEXIT_CRITICAL(&state_lock); return;
+    }
+    chunk = text_length - text_offset;
+    if (chunk > 12) chunk = 12;
+    frame[0] = 2; frame[1] = 3; frame[2] = (uint8_t)(text_seq >> 8); frame[3] = (uint8_t)text_seq;
+    frame[4] = text_part; frame[5] = text_parts;
+    frame[6] = (uint8_t)(text_length >> 8); frame[7] = (uint8_t)text_length;
     memcpy(frame + 8, text_body + text_offset, chunk);
+    connection = conn_handle; generation = connection_generation; seq = pending_seq;
+    portEXIT_CRITICAL(&state_lock);
+    // BLE allocation and notification may block or call other code: never hold
+    // the cross-core state spinlock across these library calls.
     struct os_mbuf *om = ble_hs_mbuf_from_flat(frame, chunk + 8);
-    if (!om) { pending_seq = 0; text_active = false; command_state = 3; return; }
-    int rc = ble_gatts_notify_custom(conn_handle, notify_handle, om);
-    if (rc) {
-        last_error = rc; pending_seq = 0; text_active = false;
-        command_state = 4; return;
+    bool allocated = om != NULL;
+    int rc = allocated ? ble_gatts_notify_custom(connection, notify_handle, om) : -1;
+    portENTER_CRITICAL(&state_lock);
+    if (connection_generation == generation && conn_handle == connection && pending_seq == seq && text_active) {
+        if (!allocated) { pending_seq = 0; text_active = false; command_state = 3; }
+        else if (rc) { last_error = rc; pending_seq = 0; text_active = false; command_state = 4; }
+        else {
+            last_chunk = now; text_offset += chunk; ++text_part;
+            if (text_offset == text_length) text_active = false;
+        }
     }
-    last_chunk = now; text_offset += chunk; ++text_part;
-    if (text_offset == text_length) text_active = false;
+    portEXIT_CRITICAL(&state_lock);
 }
-int pc_remote_ble_command_state(void) { return command_state; }
-
+int pc_remote_ble_command_state(void)
+{
+    portENTER_CRITICAL(&state_lock);
+    int value = command_state;
+    portEXIT_CRITICAL(&state_lock);
+    return value;
+}
 
 int pc_remote_ble_take_menu(char *out, size_t capacity)
 {

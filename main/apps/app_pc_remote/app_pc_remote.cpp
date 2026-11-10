@@ -131,7 +131,7 @@ void AppPcRemote::onRunning()
                      state == 2 ? "PC receipt: OK" :
                      state == 3 ? "Not accepted / ERROR" :
                      state == 4 ? "Receipt UNKNOWN" :
-                     state == 5 ? "Reconnect required" : "Ready");
+                     state == 5 ? "Restart required" : "Ready");
         screen.setTextColor(TFT_WHITE, THEME_COLOR_BG);
         screen.setCursor(0, 2 * line);
         if (editing_) {
