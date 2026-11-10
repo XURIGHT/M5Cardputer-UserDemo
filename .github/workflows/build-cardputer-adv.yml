@@ -2,7 +2,7 @@ name: Build Cardputer ADV Firmware
 
 on:
   push:
-    branches: [CardputerADV, 'feature/pc-remote-ble', 'feature/pc-remote-generic']
+    branches: [CardputerADV, 'feature/pc-remote-ble', 'feature/pc-remote-generic', 'test/cardputer-free-text-20261110']
   workflow_dispatch:
 
 permissions:

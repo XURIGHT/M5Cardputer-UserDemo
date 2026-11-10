@@ -2,6 +2,7 @@
 #include "pc_frame.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include "freertos/task.h"
 #include <string.h>
 #include <stdio.h>
 #include "esp_log.h"
@@ -25,6 +26,14 @@ static volatile bool notify_enabled;
 static unsigned int next_seq = 1;
 static volatile unsigned int pending_seq;
 static volatile int command_state;
+// UI task owns the bounded transmit buffer and pacing. BLE callbacks only
+// complete pending_seq/command_state. No automatic retry after unknown receipt.
+static uint8_t text_body[513];
+static size_t text_length, text_offset;
+static uint8_t text_part, text_parts;
+static unsigned int text_seq;
+static TickType_t pending_since, last_chunk;
+static volatile bool text_active;
 
 static const ble_uuid128_t service_uuid = BLE_UUID128_INIT(
     0x00,0xa1,0xc4,0x2b,0x8f,0xae,0x2e,0x9c,0x2d,0x4b,0x22,0x8c,0x00,0x10,0xbf,0x7c);
@@ -54,14 +63,20 @@ static int access_cb(uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt *
         }
         if (memcmp(input, "PING", 4) != 0) {
             unsigned int seq = 0;
+            int consumed = 0;
             char status[8] = {0};
-            if (sscanf(input, "ACK:%u:%7s", &seq, status) == 2 &&
-                pending_seq != 0 && seq == pending_seq) {
-                command_state = strcmp(status, "OK") == 0 ? 2 : 3;
+            if (sscanf(input, "ACK:%u:%7s%n", &seq, status, &consumed) != 2 ||
+                consumed != (int)size || seq == 0 || seq > 65535 ||
+                (strcmp(status, "OK") != 0 && strcmp(status, "ERR") != 0 &&
+                 strcmp(status, "UNKNOWN") != 0)) return BLE_ATT_ERR_VALUE_NOT_ALLOWED;
+            if (pending_seq != 0 && seq == pending_seq) {
+                command_state = strcmp(status, "OK") == 0 ? 2 :
+                    strcmp(status, "UNKNOWN") == 0 ? 4 : 3;
                 pending_seq = 0;
-                return 0;
             }
-            return BLE_ATT_ERR_VALUE_NOT_ALLOWED;
+            // A delayed/duplicate receipt must not overwrite a newer request,
+            // or tear down BLE after the UI's timeout. UNKNOWN remains UNKNOWN.
+            return 0;
         }
         if (OS_MBUF_PKTLEN(ctxt->om) != 4) return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
         ping_count++;
@@ -121,16 +136,17 @@ static int gap_event(struct ble_gap_event *event, void *arg)
     (void)arg;
     switch (event->type) {
     case BLE_GAP_EVENT_CONNECT:
-        if (event->connect.status == 0) { conn_handle = event->connect.conn_handle; notify_enabled = false; pending_seq = 0; command_state = 0; }
+        if (event->connect.status == 0) { conn_handle = event->connect.conn_handle; notify_enabled = false; text_active = false; next_seq = 1; pending_seq = 0; command_state = command_state == 1 ? 4 : command_state; }
         else advertise();
         break;
     case BLE_GAP_EVENT_DISCONNECT:
+        text_active = false;
         conn_handle = BLE_HS_CONN_HANDLE_NONE;
         notify_enabled = false;
         pc_frame_reset(&menu_rx);
         xQueueReset(menu_queue);
         pending_seq = 0;
-        command_state = 0;
+        if (command_state == 1) command_state = 4;
         advertise();
         break;
     case BLE_GAP_EVENT_SUBSCRIBE:
@@ -179,13 +195,14 @@ int pc_remote_ble_last_error(void) { return last_error; }
 
 int pc_remote_ble_send_task(unsigned int index)
 {
-    if (conn_handle == BLE_HS_CONN_HANDLE_NONE || !notify_enabled) return -1;
+    if (conn_handle == BLE_HS_CONN_HANDLE_NONE || !notify_enabled) { command_state = 3; return -1; }
     if (pending_seq != 0) return -2;
+    if (next_seq > 65535) { command_state = 5; return -5; }
     unsigned int seq = next_seq++;
-    if (next_seq > 999999) next_seq = 1;
     char frame[32];
     int len = snprintf(frame, sizeof(frame), "RUN:%u:%u", index, seq);
     if (len <= 0 || len >= (int)sizeof(frame)) return -3;
+    pending_since = xTaskGetTickCount();
     pending_seq = seq;
     command_state = 1;
     struct os_mbuf *om = ble_hs_mbuf_from_flat(frame, len);
@@ -193,6 +210,59 @@ int pc_remote_ble_send_task(unsigned int index)
     int rc = ble_gatts_notify_custom(conn_handle, notify_handle, om);
     if (rc) { last_error = rc; pending_seq = 0; command_state = 3; }
     return rc;
+}
+int pc_remote_ble_send_text(unsigned int index, const char *text, size_t length)
+{
+    if (conn_handle == BLE_HS_CONN_HANDLE_NONE || !notify_enabled) {
+        command_state = 3; return -1;
+    }
+    if (pending_seq || text_active) return -2;
+    if (index >= 64 || !text || length == 0 || length > 512) {
+        command_state = 3; return -3;
+    }
+    for (size_t i = 0; i < length; ++i)
+        if ((unsigned char)text[i] < 0x20 || (unsigned char)text[i] > 0x7e) {
+            command_state = 3; return -3;
+        }
+    if (next_seq > 65535) { command_state = 5; return -5; }
+    text_seq = next_seq++;
+    text_body[0] = (uint8_t)index;
+    memcpy(text_body + 1, text, length);
+    text_length = length + 1;
+    text_offset = 0; text_part = 0;
+    text_parts = (uint8_t)((text_length + 11) / 12);
+    pending_since = last_chunk = xTaskGetTickCount();
+    pending_seq = text_seq;
+    command_state = 1; text_active = true;
+    return 0;
+}
+
+void pc_remote_ble_poll(void)
+{
+    TickType_t now = xTaskGetTickCount();
+    if (!pending_seq) { text_active = false; return; }
+    if (now - pending_since >= pdMS_TO_TICKS(15000)) {
+        // The sink may already have received the text. Never claim failure or retry.
+        pending_seq = 0; text_active = false; command_state = 4; return;
+    }
+    if (!text_active || now - last_chunk < pdMS_TO_TICKS(30)) return;
+    if (!pc_remote_ble_connected() || !notify_enabled) {
+        pending_seq = 0; text_active = false; command_state = 4; return;
+    }
+    size_t chunk = text_length - text_offset;
+    if (chunk > 12) chunk = 12; // MTU 23 minus ATT 3 minus header 8.
+    uint8_t frame[20] = {2, 3, (uint8_t)(text_seq >> 8), (uint8_t)text_seq,
+        text_part, text_parts, (uint8_t)(text_length >> 8), (uint8_t)text_length};
+    memcpy(frame + 8, text_body + text_offset, chunk);
+    struct os_mbuf *om = ble_hs_mbuf_from_flat(frame, chunk + 8);
+    if (!om) { pending_seq = 0; text_active = false; command_state = 3; return; }
+    int rc = ble_gatts_notify_custom(conn_handle, notify_handle, om);
+    if (rc) {
+        last_error = rc; pending_seq = 0; text_active = false;
+        command_state = 4; return;
+    }
+    last_chunk = now; text_offset += chunk; ++text_part;
+    if (text_offset == text_length) text_active = false;
 }
 int pc_remote_ble_command_state(void) { return command_state; }
 
